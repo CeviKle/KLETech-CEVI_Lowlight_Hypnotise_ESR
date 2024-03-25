@@ -4,9 +4,9 @@ import glob
 import cv2
 import numpy as np
 import torch
-import RRDBNet_arch as arch
+import 48_EfficientSRGAN as arch
 
-model_path = 'models/RRDB_ESRGAN_x4.pth'  # models/RRDB_ESRGAN_x4.pth OR models/RRDB_PSNR_x4.pth
+model_path = 'models/48_EfficientSRGAN.pth'  # models/RRDB_ESRGAN_x4.pth OR models/RRDB_PSNR_x4.pth
 device = torch.device('cuda')  # if you want to run on CPU, change 'cuda' -> cpu
 # device = torch.device('cpu')
 

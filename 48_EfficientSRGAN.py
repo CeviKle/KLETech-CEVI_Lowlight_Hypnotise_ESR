@@ -1,55 +1,78 @@
-import os
+import functools
 import torch
-import RRDBNet_arch as arch
+import torch.nn as nn
+import torch.nn.functional as F
 
-pretrained_net = torch.load('./models/RRDB_ESRGAN_x4.pth')
-save_path = './models/RRDB_ESRGAN_x4.pth'
 
-crt_model = arch.RRDBNet(3, 3, 64, 23, gc=32)
-crt_net = crt_model.state_dict()
+def make_layer(block, n_layers):
+    layers = []
+    for _ in range(n_layers):
+        layers.append(block())
+    return nn.Sequential(*layers)
 
-load_net_clean = {}
-for k, v in pretrained_net.items():
-    if k.startswith('module.'):
-        load_net_clean[k[7:]] = v
-    else:
-        load_net_clean[k] = v
-pretrained_net = load_net_clean
 
-print('###################################\n')
-tbd = []
-for k, v in crt_net.items():
-    tbd.append(k)
+class ResidualDenseBlock_5C(nn.Module):
+    def __init__(self, nf=64, gc=32, bias=True):
+        super(ResidualDenseBlock_5C, self).__init__()
+        # gc: growth channel, i.e. intermediate channels
+        self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1, bias=bias)
+        self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1, bias=bias)
+        self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1, bias=bias)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
-# directly copy
-for k, v in crt_net.items():
-    if k in pretrained_net and pretrained_net[k].size() == v.size():
-        crt_net[k] = pretrained_net[k]
-        tbd.remove(k)
+        # initialization
+        # mutil.initialize_weights([self.conv1, self.conv2, self.conv3, self.conv4, self.conv5], 0.1)
 
-crt_net['conv_first.weight'] = pretrained_net['model.0.weight']
-crt_net['conv_first.bias'] = pretrained_net['model.0.bias']
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
+        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
+        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
+        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
+        return x5 * 0.2 + x
 
-for k in tbd.copy():
-    if 'RDB' in k:
-        ori_k = k.replace('RRDB_trunk.', 'model.1.sub.')
-        if '.weight' in k:
-            ori_k = ori_k.replace('.weight', '.0.weight')
-        elif '.bias' in k:
-            ori_k = ori_k.replace('.bias', '.0.bias')
-        crt_net[k] = pretrained_net[ori_k]
-        tbd.remove(k)
 
-crt_net['trunk_conv.weight'] = pretrained_net['model.1.sub.23.weight']
-crt_net['trunk_conv.bias'] = pretrained_net['model.1.sub.23.bias']
-crt_net['upconv1.weight'] = pretrained_net['model.3.weight']
-crt_net['upconv1.bias'] = pretrained_net['model.3.bias']
-crt_net['upconv2.weight'] = pretrained_net['model.6.weight']
-crt_net['upconv2.bias'] = pretrained_net['model.6.bias']
-crt_net['HRconv.weight'] = pretrained_net['model.8.weight']
-crt_net['HRconv.bias'] = pretrained_net['model.8.bias']
-crt_net['conv_last.weight'] = pretrained_net['model.10.weight']
-crt_net['conv_last.bias'] = pretrained_net['model.10.bias']
+class RRDB(nn.Module):
+    '''Residual in Residual Dense Block'''
 
-torch.save(crt_net, save_path)
-print('Saving to ', save_path)
+    def __init__(self, nf, gc=32):
+        super(RRDB, self).__init__()
+        self.RDB1 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB2 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB3 = ResidualDenseBlock_5C(nf, gc)
+
+    def forward(self, x):
+        out = self.RDB1(x)
+        out = self.RDB2(out)
+        out = self.RDB3(out)
+        return out * 0.2 + x
+
+
+class RRDBNet(nn.Module):
+    def __init__(self, in_nc, out_nc, nf, nb, gc=32):
+        super(RRDBNet, self).__init__()
+        RRDB_block_f = functools.partial(RRDB, nf=nf, gc=gc)
+
+        self.conv_first = nn.Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+        self.RRDB_trunk = make_layer(RRDB_block_f, nb)
+        self.trunk_conv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        #### upsampling
+        self.upconv1 = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.upconv2 = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.HRconv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+    def forward(self, x):
+        fea = self.conv_first(x)
+        trunk = self.trunk_conv(self.RRDB_trunk(fea))
+        fea = fea + trunk
+
+        fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        out = self.conv_last(self.lrelu(self.HRconv(fea)))
+
+        return out
